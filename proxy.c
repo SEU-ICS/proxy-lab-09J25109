@@ -9,6 +9,130 @@
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 
+#define CACHE_BLOCKS 32
+
+typedef struct
+{
+    char uri[MAXLINE];
+    char object[MAX_OBJECT_SIZE];
+    int size;
+    unsigned long lru;
+    int valid;
+} cache_block;
+
+typedef struct
+{
+    cache_block blocks[CACHE_BLOCKS];
+    int total_size;
+    unsigned long clock;
+    pthread_rwlock_t lock;
+} cache_t;
+
+cache_t cache;
+
+int find_lru_block()
+{
+    int victim = -1;
+    unsigned long min_lru = 4294967295;
+
+    for(int i = 0; i < CACHE_BLOCKS; i++)
+    {
+        if(cache.blocks[i].valid && cache.blocks[i].lru < min_lru)
+        {
+            min_lru = cache.blocks[i].lru;
+            victim = i;
+        }
+    }
+
+    return victim;
+}
+
+int find_empty_block(void)
+{
+    for(int i = 0; i < CACHE_BLOCKS; i++)
+    {
+        if(!cache.blocks[i].valid)
+            return i;
+    }
+    return -1;
+}
+
+void cache_init()
+{
+    cache.total_size = 0;
+    cache.clock = 0;
+
+    pthread_rwlock_init(&cache.lock, NULL);
+
+    for(int i = 0; i < CACHE_BLOCKS; i++)
+    {
+        cache.blocks[i].valid = 0;
+        cache.blocks[i].size = 0;
+        cache.blocks[i].lru = 0;
+    }
+}
+
+void cache_write(const char *uri, const char *object, int size)
+{
+    if(size > MAX_OBJECT_SIZE)
+        return;
+
+    pthread_rwlock_wrlock(&cache.lock);
+
+    while (cache.total_size + size > MAX_CACHE_SIZE)
+    {
+        int victim = find_lru_block();
+        if (victim == -1)
+            break;
+
+        cache.total_size -= cache.blocks[victim].size;
+
+        cache.blocks[victim].valid = 0;
+        cache.blocks[victim].size = 0;
+    }
+
+    int index = find_empty_block();
+
+    if(index == -1)
+    {
+        index = find_lru_block();
+        if(index != -1)
+            cache.total_size -= cache.blocks[index].size;
+    }
+
+    if (index != -1)
+    {
+        strcpy(cache.blocks[index].uri, uri);
+        memcpy(cache.blocks[index].object, object, size);
+
+        cache.blocks[index].size = size;
+        cache.blocks[index].lru = ++cache.clock;
+        cache.blocks[index].valid = 1;
+        cache.total_size += size;
+    }
+
+    pthread_rwlock_unlock(&cache.lock);
+}
+
+int cache_read(const char *uri, int connfd)
+{
+    pthread_rwlock_rdlock(&cache.lock);
+
+    for(int i = 0; i < CACHE_BLOCKS; i++)
+    {
+        if(cache.blocks[i].valid && !strcmp(cache.blocks[i].uri, uri))
+        {
+            cache.blocks[i].lru = ++cache.clock;
+            Rio_writen(connfd, cache.blocks[i].object, cache.blocks[i].size);
+            pthread_rwlock_unlock(&cache.lock);
+            return 1;
+        }
+    }
+
+    pthread_rwlock_unlock(&cache.lock);
+    return 0;
+}
+
 void parse_uri(char *uri, char *hostname, char *port, char *path)
 {
     char *host_start, *path_start;
@@ -80,11 +204,7 @@ void doit(int connfd)
     Rio_readinitb(&rio, connfd);
     if(!Rio_readlineb(&rio, buf, MAXLINE))  return;
     sscanf(buf, "%s %s %s", method, uri, version);
-    if(strcasecmp(method, "GET"))
-    {
-        printf("Unsupported method: %s\n", method);
-        return;
-    }
+    if(strcasecmp(method, "GET") || cache_read(uri, connfd))    return;
     parse_uri(uri, hostname, port, path);
 
 
@@ -97,9 +217,29 @@ void doit(int connfd)
 
     Rio_readinitb(&server_rio, serverfd);
     ssize_t n;
+    
+    char object[MAX_OBJECT_SIZE];
+    int object_size = 0;
+    int cacheable = 1;
     while((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0)
+    {
         Rio_writen(connfd, buf, n);
 
+        if(cacheable)
+        {
+            if(object_size + n <= MAX_OBJECT_SIZE)
+            {
+                memcpy(object + object_size, buf, n);
+                object_size += n;
+            } 
+            else
+            {
+                cacheable = 0;
+            }
+        }
+    }
+    if(cacheable)
+        cache_write(uri, object, object_size);
     Close(serverfd);
 }
 
@@ -115,7 +255,7 @@ void *thread(void *vargp)
 
 int main(int argc, char **argv)
 {
-    int listenfd;
+    int listenfd ;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
 
@@ -125,7 +265,9 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    cache_init();
     listenfd = Open_listenfd(argv[1]);
+
 
     while(1)
     {
