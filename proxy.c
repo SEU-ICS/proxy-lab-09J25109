@@ -69,6 +69,7 @@ void build_headers(rio_t *client_rio, char *request, const char *hostname, const
     strcat(request, other_headers);
     strcat(request, "\r\n");
 }
+
 void doit(int connfd)
 {
     rio_t rio, server_rio;
@@ -102,9 +103,19 @@ void doit(int connfd)
     Close(serverfd);
 }
 
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);
+    Pthread_detach(pthread_self());
+    Free(vargp);
+    doit(connfd);
+    Close(connfd);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
-    int listenfd,connfd;
+    int listenfd;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
 
@@ -118,10 +129,12 @@ int main(int argc, char **argv)
 
     while(1)
     {
+        pthread_t tid;
+
         clientlen = sizeof(clientaddr);
-        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-        doit(connfd);
-        Close(connfd);
+        int *connfdp = Malloc(sizeof(int));
+        *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        Pthread_create(&tid, NULL, thread, connfdp);
     }
     printf("%s", user_agent_hdr);
     return 0;
